@@ -1,9 +1,6 @@
 import os
 import io
-import re
-import boto3
 import textwrap
-import requests
 import numpy as np
 import pandas as pd
 from io import BytesIO
@@ -13,32 +10,27 @@ from urllib.parse import urlparse
 from flask import Flask,request,jsonify
 from botocore.exceptions import ClientError
 from pdfminer.high_level import extract_text
-import json
-import openpyxl
-import xlrd
-import asyncio
 import aiohttp
-
-with open('config.json', 'r') as config_file:
-    config = json.load(config_file)
-
-bucket_name = config['BUCKET_NAME']
+import asyncio
+from waitress import serve
 
 app = Flask(__name__)
 
 class CASS:
     
-    def __init__(self,pdf_path_or_url : str, email: str = None):
+    def __init__(self, pdf_path_or_url: str, email: str = None):
         self.pdf_path_or_url = pdf_path_or_url
         self.flag = bool
         self.email = email
-        self.etag = None
-        self.data = None  # Initialize data attribute
-        self.ext = None   # Initialize ext attribute
-    def log(self,message:str,success_flag=True):
-        if success_flag: print(f"\n\n###################   {message}   ###################")
-        else: print(f"!!!!!!!!!!!!!!!!!!   {message}   !!!!!!!!!!!!!!!!!!!!") 
-          
+        self.data = None 
+        self.ext = None
+
+    def log(self, message: str, success_flag=True):
+        if success_flag: 
+            print(f"\n\n###################   {message}   ###################")
+        else: 
+            print(f"!!!!!!!!!!!!!!!!!!   {message}   !!!!!!!!!!!!!!!!!!!!") 
+
     def get_content_type(self):
         mime_types = {
             '.pdf': 'application/pdf',
@@ -53,41 +45,30 @@ class CASS:
         }
         _, extension = os.path.splitext(self.pdf_path_or_url)
         return mime_types.get(extension.lower(), 'application/octet-stream')
-    
+
     async def download_url(self):
         try:
-            if self.pdf_path_or_url.startswith("http"):
-                self.log("Downloading URL")
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(self.pdf_path_or_url) as response:
+            self.log("Attempting to download content")
+            timeout = aiohttp.ClientTimeout(total=30)  # Set a timeout for the request
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.pdf_path_or_url) as response:
+                    response.raise_for_status()
+                    if response.status == 200:
                         self.flag = True
-                        response.raise_for_status()
-                        if response.status == 200:
-                            self.log("Downloaded successfully!")
-                            return await response.read(), response.headers.get('Content-Type')
-            else:
-                with open(self.pdf_path_or_url, 'rb') as f:
-                    return f.read(), self.get_content_type()
-        except aiohttp.ClientError as e:
-            self.log(f"Failed to download file from {self.pdf_path_or_url}", success_flag=False)
+                        self.log("Downloaded successfully!")
+                        content_type = response.headers.get('Content-Type', 'application/octet-stream')
+                        return await response.read(), content_type
+                    else:
+                        self.log(f"Failed to download. Status code: {response.status}")
+                        return None, None
+        except (aiohttp.ClientError, aiohttp.InvalidURL, aiohttp.ClientConnectorError) as e:
+            self.log(f"HTTP Client Error or Invalid URL: {str(e)}", success_flag=False)
             return None, None
-        except FileNotFoundError as e:
-            self.log(f"File not found: {self.pdf_path_or_url}", success_flag=False)
+        except asyncio.TimeoutError:
+            self.log("Download timed out", success_flag=False)
             return None, None
 
-            
-    def extract_invoice_number(self,text: str):
-            
-        invoice_numbers = re.findall(r'\b\d{5}\b', text)
-        if invoice_numbers: return invoice_numbers
-        else:
-            pattern = r'(?:invoice\s*(?:no(?:\.|:)?|number|num)?\s*:?)(\d{5})'
-            invoice_numbers = re.search(pattern, text, re.IGNORECASE)
-            if invoice_numbers:
-                return invoice_numbers.group()
-            else:
-                return
-            
+
     async def get_text_pdf(self):
         self.data, self.ext = await self.download_url()
         if self.data:
@@ -101,7 +82,7 @@ class CASS:
                 return [self.wrapped_text]
         else:
             return None
-    
+
     async def get_text_doc(self, file_path="temp.docx"):
         self.data, self.ext = await self.download_url()
         if self.data:
@@ -116,7 +97,7 @@ class CASS:
             return self.wrapped_text
         else:
             return None
-    
+
     async def get_text_csv(self):
         self.data, self.ext = await self.download_url()
         if self.data:
@@ -137,80 +118,41 @@ class CASS:
         else:
             return None
 
-    
-    async def upload_to_s3(self):
-        
-        if not self.data and not self.ext:
-            self.data, self.ext = await self.download_url()
-            
-        if self.data and self.ext:
-            s3 = boto3.client(
-                    's3',
-                    aws_access_key_id=config['AWS_ACCESS_KEY_ID'],
-                    aws_secret_access_key=config['AWS_SECRET_ACCESS_KEY']
-                )
-            #bucket_name = bucket_name
-            s3_file_name = f'{self.email}.{self.ext.split("/")[-1]}'
-            try:
-    
-                response = s3.put_object(Bucket=bucket_name, Key=s3_file_name, Body=self.data, ContentType=self.ext)
-                self.etag = response.get('ETag')
-                self.log(f'File "{s3_file_name}" uploaded to bucket "{bucket_name}" successfully.')
-            
-                return s3_file_name
-                
-            except ClientError as e:
-                print(f'An error occurred: {e.response["Error"]["Message"]}')
-                return None
-        
-    
 @app.route("/")
 def explain():
-    return """
-    Server Running Successfully
-    """
+    return "Server Running Successfully"
 
-    
-@app.route("/get_text",methods=['POST'])
+@app.route("/get_text", methods=['POST'])
 async def text_parser():
-    fla = bool
-    text = None
-    etag = None
-    
     if request.is_json:
         data = request.json
         pth_url = data.get('path_url')
         email = data.get('email')
         
         if pth_url and email:
-            
-            obj = CASS(pth_url,email)
+            obj = CASS(pth_url, email)
             
             parsed_url = urlparse(pth_url)
             _, file_extension = os.path.splitext(parsed_url.path)
             
-            if file_extension.lower() in ('.docx','.doc'):
+            if file_extension.lower() in ('.docx', '.doc'):
                 text = await obj.get_text_doc()
-            elif file_extension.lower() in ('.csv','.xlsx','.xls'):
+            elif file_extension.lower() in ('.csv', '.xlsx', '.xls'):
                 text = await obj.get_text_csv()
             elif file_extension.lower() == '.pdf':
                 text = await obj.get_text_pdf()
                 text = text[0] if text else None
-                
             else:
-                url_type = "unknown" 
-                text = ""
+                obj.log(f"Unsupported file extension: {file_extension}", success_flag=False)
+                text = None
             
-            etag = await obj.upload_to_s3()
-            
-            if text and etag:
-                return jsonify({'text': text,'file_name':etag}), 200
+            if text:
+                return jsonify({'text': text}), 200
             else:
                 return jsonify({'error': "Can't extract data from the URL"}), 404
-
     else:
-        return jsonify({'error': 'This server only accepts json please parse json'}), 400
+        return jsonify({'error': 'This server only accepts JSON please pass JSON'}), 400
 
-        
 if __name__ == '__main__':
-    app.run(debug=True)
+    serve(app, host='0.0.0.0', port=5000)
+    app.run()
