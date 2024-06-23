@@ -154,5 +154,5 @@ async def text_parser():
         return jsonify({'error': 'This server only accepts JSON please pass JSON'}), 400
 
 if __name__ == '__main__':
-    serve(app, host='0.0.0.0', port=5000)
-    app.run()
+    serve(app, host='0.0.0.0', port=5001)
+    #app.run(host='0.0.0.0', port=5001)
